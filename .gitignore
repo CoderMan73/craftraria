@@ -59,8 +59,13 @@ hs_err_pid*.log
 build/
 out/
 
-# Gradle wrapper
-gradle/wrapper/gradle-wrapper.jar
+# Loom dev run output. Holds the dev instance's world, config, and Rinku's own ~190 MB JCEF
+# install; none of it belongs in the repo, and CI builds from the tagged source instead.
+run/
+
+# Gradle wrapper (jar kept on purpose: without it neither a fresh clone nor the release
+# workflow on Linux CI can build; gradlew's executable bit is a release-contract item,
+# see docs/commits-and-releases.md)
 
 # Logs
 *.log

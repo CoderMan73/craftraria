@@ -11,9 +11,9 @@ each milestone against PLAN.md (tracked in the tracking workspace, not in this r
 | Technology | Version | Purpose |
 |------------|---------|---------|
 | Fabric Loader + API | 1.26.2 | Mod loader for Minecraft Java Edition |
-| Java | 21 (pin at M1) | Language/runtime. Rinku 3.0.5's own build declares `java_version=25`; verify the resolved artifact's class-file version at M1 and pin the toolchain to match - do not assume 21 still works |
+| Java | 25 (pinned at M1) | Language/runtime. Rinku's own build declares `java_version=25` and the resolved artifact is class-file 69; 21 does not work. Local builds need `JAVA_HOME` pointed at a real JDK 25 (IntelliJ-provisioned `.jdks/loom-ea-25-loom+1-11`); the PATH default is 1.8 and must not be used. Evidence: `ai-docs/notes/2026-10-14-rinku-toolchain-probe.md` |
 | Gradle | Fabric Loom 1.15.5 | Build system (`fabric_version=0.153.0+26.2`) |
-| Rinku | 3.0.5-26.2 | Embedded Chromium browser via `de.keksuccino:rinku-fabric:3.0.5-26.2` (Maven: https://keksuccino.github.io/maven/) |
+| Rinku | 3.0.4-26.2 (pinned at M1) | Embedded Chromium browser via `de.keksuccino:rinku-fabric:3.0.4-26.2` (Maven: https://keksuccino.github.io/maven/). PLAN.md says 3.0.5-26.2, but that version is not published: the newest artifact on the maven is 3.0.4-26.2, the exact version craftlatro shipped, so the API surface is proven. When 3.0.5-26.2 appears, bump the one line in `gradle.properties` and re-run the M1 probes. Evidence: `ai-docs/notes/2026-10-14-rinku-toolchain-probe.md` |
 | Cloth Config | 26.2.x | Settings screen for `CraftrariaConfig`; hard dependency, declared in `fabric.mod.json` (Maven: https://maven.shedaniel.me/) |
 | Mod Menu | 20.0.x (compile only) | Optional: exposes the settings screen as its config button. Not a runtime dependency |
 | Terrarium wasm port | release 1.0 (36,314,788 bytes) | MercuryWorkshop/terraria-wasm build: engine plus recompiled game code, no assets. Downloaded at runtime by `TerrariaBuildDownloader`, unpacked to `<instance>/craftraria/game/build/`, never into the repo or the jar. Pin recorded in `ai-docs/decisions/pin-terrarium-build.md` |
@@ -155,6 +155,29 @@ stats report). Reuse its proven classes as the porting base rather than re-deriv
 
 ## Gotchas
 
+- **After `gradlew clean`, the next run needs `--no-configuration-cache` once.** Loom writes the
+  client's argument file into `build/loom-cache/argFiles/runClient` (as an undeclared output of its
+  `configureClientLaunch` configuration-time action); a `clean` removes it while the configuration
+  cache still references it, and the reusing run then dies with `could not open build/loom-cache/
+  argFiles/runClient` - a Java launcher error with no mention of Gradle or Loom. Rebuilding the cache
+  is the whole fix; afterwards every flagless run works again. **Two build-script fixes were tried and
+  measured not to work** (an input property on `runClient`, and on the producing
+  `configureClientLaunch` via a lazy matcher): the task reports `UP-TO-DATE` either way, because the
+  file is not a declared output. Do not retry them.
+- **Never hand back a post-`clean` state.** A verification pass that ends with `gradlew clean build`
+  leaves the configuration cache pointing at a deleted argFile, so the *user's* next flagless
+  `runClient` fails - this cost two launches. After any `clean`, repair it yourself
+  (`runClient --no-configuration-cache` once) and prove the handback with a flagless
+  `runClient --dry-run` that says `Reusing configuration cache`.
+- **Never open the Terraria screen while Rinku's Chromium install has failed.** Rinku downloads and
+  publishes its own JCEF into `<instance>/run/rinku-libraries` at first launch; that step failed once
+  on Windows with an `AccessDeniedException` (virus-scanner lock on the freshly extracted ~190 MB),
+  leaving Rinku uninitialized, and a keypress that opened the screen then aborted the whole client
+  with `NTSTATUS 0xCFFFFFFF` and no `hs_err`. Gate on
+  `RinkuDownloadListener.INSTANCE.isFailed()` before opening, and close the screen on `onInit(false)`.
+  Player remedy: delete `run/rinku-libraries` and relaunch. Evidence:
+  `ai-docs/notes/2026-10-14-rinku-jcef-install-crash.md`
+- **`Minecraft.setScreen` no longer exists in 26.2**: screens are set through `minecraft.gui.setScreen(...)`.
 - **Never size a freshly created Rinku browser through `Rinku.createBrowser(url, transparent, width,
   height)`.** Resizing a browser inside that overload crashed craftlatro's client natively - an
   `EXCEPTION_ACCESS_VIOLATION` in `jemalloc.dll` under `AsyncResourceLeaseManager.drain` in Rinku's
@@ -190,7 +213,10 @@ stats report). Reuse its proven classes as the porting base rather than re-deriv
   `glfwSetClipboardString` for anything clipboard-related.
 - COOP/COEP headers on the local server are mandatory (SharedArrayBuffer/OPFS do not run
   otherwise); the file-picker surface (`showDirectoryPicker`, `showOpenFilePicker`,
-  `navigator.keyboard.lock`) is probed at M1 - design assumes no browser picker in the flow.
+  `navigator.keyboard.lock`) was probed at M1 and **all of it exists** inside Rinku's Chromium
+  (2026-10-14, `ai-docs/notes/2026-10-14-jcef-environment-probes.md`). The M3 hand-off therefore
+  does not depend on a browser picker, but a future one is not blocked; what is unmeasured is
+  whether a picker *completes* under OSR with no user gesture.
 
 ## Local Skills
 

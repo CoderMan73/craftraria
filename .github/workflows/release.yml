@@ -1,0 +1,41 @@
+name: release
+
+# Fires when a release is published, builds the tagged source and attaches the jar, so the artifact on
+# the release is the one that source produces rather than one copied from a laptop. Creating the
+# release stays a human decision; this only makes sure what gets attached is right.
+#
+# CI is Linux while development is Windows: gradlew's executable bit and an un-ignored
+# gradle/wrapper/gradle-wrapper.jar are release-contract items, documented in
+# docs/commits-and-releases.md.
+
+on:
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+
+jobs:
+  jar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/gradle-build-action@v2
+      - name: Build
+        run: ./gradlew build
+      - name: Attach the jar
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for jar in build/libs/craftraria-*.jar; do
+            case "$jar" in
+              *-sources.jar) continue ;;
+            esac
+            gh release upload "${{ github.event.release.tag_name }}" "$jar" --clobber
+          done

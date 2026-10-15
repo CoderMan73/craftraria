@@ -1,0 +1,462 @@
+<!doctype html>
+<!--
+  craftraria's mod-written loader page (no bundler, vanilla JS).
+
+  Three jobs, in order:
+
+  1. Serve the one file upstream's boot script fetches over the network - libcurl.wasm, the generic
+     libcurl WebAssembly build - from this mod's verified local copy instead of the CDN. The pin is
+     recorded in LibcurlRuntimeDownloader; the substitution is a fetch wrapper, not a patch, so the
+     game code that arrives is byte-for-byte the pinned release's.
+
+  2. Stage the player's own Content (content.tar, packed by the mod from their install) into OPFS
+     under Content/, where the game's mount_opfs() expects to find it. The version marker
+     (content.version) is compared against a copy kept in OPFS so a re-extract only happens when the
+     player's Content actually changed - the same mtime/size discipline the mod's build marker uses.
+
+  3. Boot the pinned port's own module (/assets/index.js from the wasm build). It mounts upstream's
+     UI onto #app, calls its preInit - which is the dotnet.withConfig({pthreadPoolInitialSize:16})
+     bootstrap and the mount_opfs() this page prepared for - and waits for the player to press play.
+     Release 1.0's boot path passes no jiterpreter option; the module hardcodes its own config and
+     this page does not override it.
+
+  Paths: the local HTTP server is rooted at the extracted build directory and aliases /www/ to the
+  mod-written pages, so /_framework/dotnet.js (an absolute import inside the pinned module) resolves
+  against the build even though this page lives somewhere else.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Terraria</title>
+<link rel="icon" href="/app.ico">
+<link rel="stylesheet" href="/assets/index.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #e6edf3; font: 14px/1.5 system-ui, sans-serif; }
+  #staging { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; }
+  #staging[hidden] { display: none; }
+  #staging .bar { width: min(420px, 80vw); height: 6px; background: #232a33; border-radius: 3px; overflow: hidden; }
+  #staging .bar > div { height: 100%; width: 0%; background: #3ba8ff; transition: width 120ms linear; }
+  #staging .note { color: #8b98a8; font-size: 12px; max-width: 80vw; text-align: center; }
+  #app[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="staging">
+  <div id="staging-text">Preparing Terraria...</div>
+  <div class="bar"><div id="staging-progress"></div></div>
+  <div class="note" id="staging-note"></div>
+</div>
+<div id="app" hidden></div>
+<script>
+"use strict";
+
+const CDN_LIBCURL = "https://cdn.jsdelivr.net/npm/libcurl.js@0.6.20/libcurl.wasm";
+const LOCAL_LIBCURL = "./libs/libcurl.wasm";
+const OPFS_CONTENT_DIR = "Content";
+const OPFS_MARKER_NAME = ".craftraria-content-version";
+// Upstream's own content contract: hasContent() requires Content/{Fonts,Images,Sounds} *and* a
+// ".ContentExists" file at the OPFS root, which it writes at the end of every one of its install
+// paths (skipOobe, copy-local-assets, untar, steam download). Without that marker the game shows its
+// "you need to install Terraria" splash even though the staged content is sitting right there - which
+// is exactly what the player saw, three directories staged and the splash still asking for assets.
+const OPFS_CONTENT_EXISTS_NAME = ".ContentExists";
+// How long the overlay waits for the game's own UI before uncovering the window anyway.
+const GAME_UI_TIMEOUT_MILLIS = 120000;
+const OPFS_VERSION_MARKER = OPFS_CONTENT_DIR + "/" + OPFS_MARKER_NAME;
+
+const stagingText = document.getElementById("staging-text");
+const stagingProgress = document.getElementById("staging-progress");
+const stagingNote = document.getElementById("staging-note");
+const app = document.getElementById("app");
+
+// The module captures window.fetch at import time, so this has to be installed before the import.
+const realFetch = window.fetch.bind(window);
+
+/*
+ * Mirror the console into the window title.
+ *
+ * The pinned module narrates its own boot to the browser console - "initializing dotnet",
+ * "loading libcurl", "PreInit...", "mount_opfs: mounted opfs", "dotnet initialized", "Init :",
+ * "MainLoop..." - and none of that is visible from Minecraft, where a stalled engine looks exactly
+ * like a slow one. The title is the only channel the mod's side can observe, so the boot's own
+ * words are copied there and logged by the browser screen. Throttled, because a chatty module
+ * would otherwise change the title every frame.
+ */
+const consoleMirrorLast = { at: 0 };
+for (const level of ["log", "info", "warn", "error", "debug"]) {
+	const original = console[level] ? console[level].bind(console) : null;
+	if (!original) {
+		continue;
+	}
+	console[level] = (...args) => {
+		original(...args);
+		const now = performance.now();
+		if (now - consoleMirrorLast.at < 250) {
+			return;
+		}
+		consoleMirrorLast.at = now;
+		const line = args.map(argument => String(argument)).join(" ").slice(0, 160);
+		document.title = "terraria console: " + line;
+	};
+}
+	// A self-check, logged before anything else: the whole embedding depends on this page being
+	// cross-origin isolated (COOP/COEP), and when it is not, the symptom is a window that waits
+	// forever while the game's own boot silently takes a fallback path that cannot work here. That
+	// combination cost a debugging session once; this prints the answer up front instead.
+	(async () => {
+		const headers = {};
+		try {
+			const own = await realFetch("./index.html", { method: "GET" });
+			headers.coop = own.headers.get("Cross-Origin-Opener-Policy");
+			headers.coep = own.headers.get("Cross-Origin-Embedder-Policy");
+			headers.corp = own.headers.get("Cross-Origin-Resource-Policy");
+		} catch (failure) {
+			headers.error = String(failure);
+		}
+		console.log("[craftraria] boot check: crossOriginIsolated=" + self.crossOriginIsolated
+				+ " sharedArrayBuffer=" + (typeof SharedArrayBuffer !== "undefined")
+				+ " serviceWorkerController=" + (navigator.serviceWorker ? navigator.serviceWorker.controller !== null : "n/a")
+				+ " headers=" + JSON.stringify(headers)
+				+ " location=" + location.href);
+	})();
+
+	window.fetch = (input, init) => {
+	const url = input instanceof Request ? new URL(input.url, location.href) : new URL(input, location.href);
+	if (url.href === CDN_LIBCURL) {
+		return realFetch(LOCAL_LIBCURL, init);
+	}
+	return realFetch(input, init);
+};
+
+function report(text, fraction, note) {
+	stagingText.textContent = text;
+	if (fraction != null) {
+		stagingProgress.style.width = Math.round(fraction * 100) + "%";
+	}
+	stagingNote.textContent = note || "";
+	// Visible in the browser window's title bar and observable from the mod's side through JCEF's
+	// title-change callback, which is how /craftraria stats' report and the probe harness know what
+	// the page is doing without a page-to-Java bridge.
+	document.title = "Terraria - " + text;
+}
+
+async function stageContent() {
+	let summary = null;
+	const root = await navigator.storage.getDirectory();
+	let marker = null;
+	try {
+		const contentDir = await root.getDirectoryHandle(OPFS_CONTENT_DIR);
+		const handle = await contentDir.getFileHandle(OPFS_MARKER_NAME, { create: false });
+		marker = await (await handle.getFile()).text();
+	} catch {
+		marker = null;
+	}
+
+	let version;
+	try {
+		version = (await (await realFetch("./content.version")).text()).trim();
+	} catch {
+		version = "";
+	}
+
+	if (version && version === marker && await hasStagedContent(root)) {
+		report("Starting Terraria...", 1, "Content already staged.");
+		// A run staged before the marker was known about has the content but not the game's marker;
+		// check it rather than making the player wait for another unpack.
+		await ensureContentExists(root);
+		return;
+	}
+
+	if (version && version === marker) {
+		// The version marker said "staged" but the tree it described is incomplete - the case when the
+		// tar it was unpacked from was itself truncated by a crash. Staging again is the only repair.
+		console.error("[craftraria] version marker matched but Content/{Fonts,Images,Sounds} is "
+				+ "incomplete; staging again from content.tar");
+		report("Unpacking your Terraria Content into browser storage...", 0.1,
+				"The previous unpack was incomplete; unpacking again.");
+	}
+	report("Fetching your Terraria Content...", 0.05, version ? "content " + version : "");
+	const fetchStarted = performance.now();
+	console.log("[craftraria] fetching content.tar");
+	const response = await realFetch("./content.tar");
+	if (!response.ok) {
+		throw new Error("content.tar fetch failed: HTTP " + response.status);
+	}
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	console.log("[craftraria] fetched content.tar: " + bytes.length + " bytes in "
+			+ Math.round(performance.now() - fetchStarted) + "ms");
+	report("Unpacking your Terraria Content into browser storage...", 0.2,
+			(bytes.length / 1048576).toFixed(1) + " MB");
+
+	summary = await stageOnMainThread(bytes, version);
+	const megabytes = (summary.bytesWritten / 1048576).toFixed(1);
+	const seconds = (summary.elapsedMillis / 1000).toFixed(1);
+	const rate = Math.round((summary.written / Math.max(1, summary.elapsedMillis)) * 1000);
+	console.log("[craftraria] staged " + summary.written + " files (" + megabytes + " MB) in "
+			+ seconds + "s at " + rate + " files/s");
+	report("Starting Terraria...", 1, summary.written + " files staged in " + seconds + "s");
+}
+
+/**
+ * Stages the tar into OPFS, a few files in flight at a time.
+ *
+ * <p>Two things make this fast, both measured in Rinku's Chromium against a synthetic 2,000-file
+ * tree through the same server and page the player uses:
+ *
+ * <p>Concurrency. OPFS operations are asynchronous round-trips, and issuing them one at a time
+ * spends the whole cost of each latency with nothing else in flight. Eight at a time turns that
+ * serial latency into a pipeline, and was the largest single win available.
+ *
+ * <p>A directory cache keyed by path. Resolving a path once instead of once per file removes two or
+ * three awaited lookups from every file - which is what the first version of this page paid. The
+ * cache holds *promises*, not handles, because the lanes run concurrently and two lanes asking for
+ * the same new directory must share one creation rather than race.
+ *
+ * <p>A worker with sync access handles was tried and measured slower than this (34 vs 42 files/s on
+ * the same tree), because sync handles cost more per operation in this Chromium than awaited ones;
+ * it also added a file and a message protocol, so it did not ship.
+ */
+const STAGING_CONCURRENCY = 8;
+
+async function stageOnMainThread(bytes, version) {
+	const parsed = readTar(bytes);
+	const entries = parsed.entries;
+	if (parsed.truncated) {
+		// A truncated tar unpacks to a partial tree that looks fine, so the reader says so rather
+		// than letting a version marker be written for it below.
+		console.error("[craftraria] content.tar is truncated (" + entries.length
+				+ " complete entries); the pack was interrupted. The marker will not be written, so the "
+				+ "next launch unpacks again - re-pack with /craftraria reload for a complete archive.");
+	}
+	const root = await navigator.storage.getDirectory();
+	const contentDir = await resolveDir(root, [OPFS_CONTENT_DIR]);
+	const dirCache = new Map();
+	const started = performance.now();
+
+	let next = 0;
+	let written = 0;
+	let bytesWritten = 0;
+	let lastReport = 0;
+
+	const writeOne = async () => {
+		while (next < entries.length) {
+			const entry = entries[next++];
+			bytesWritten += await writeOpfsFile(contentDir, entry.name, entry.content, dirCache);
+			written++;
+			const now = performance.now();
+			if (now - lastReport >= 200) {
+				lastReport = now;
+				report("Unpacking your Terraria Content into browser storage...",
+						0.2 + 0.75 * (written / entries.length),
+						written + " / " + entries.length + " files");
+			}
+		}
+	};
+
+	await Promise.all(Array.from({ length: STAGING_CONCURRENCY }, writeOne));
+
+	// The marker is written last and only once everything else is on disk: an interrupted unpack
+	// leaves it stale, and a stale marker is what makes the next launch unpack again instead of
+	// trusting a half-written tree.
+	if (!parsed.truncated) {
+		const markerFile = await contentDir.getFileHandle(OPFS_MARKER_NAME, { create: true });
+		const writable = await markerFile.createWritable();
+		await writable.write(version);
+		await writable.close();
+		await ensureContentExists(root);
+	}
+
+	return {
+		written,
+		total: entries.length,
+		bytesWritten,
+		elapsedMillis: Math.round(performance.now() - started)
+	};
+}
+
+/**
+ * Is the tree the game actually needs already in OPFS?
+ *
+ * <p>The version marker alone is not enough: it is written at the end of a successful unpack, but a
+ * truncated content.tar unpacks "successfully" too - the reader stops at the last complete block -
+ * and leaves the marker standing for half a tree. The directories the game's own hasContent()
+ * checks are what make the marker trustworthy, so they are checked here as well.
+ */
+async function hasStagedContent(root) {
+	try {
+		const contentDir = await root.getDirectoryHandle(OPFS_CONTENT_DIR, { create: false });
+		for (const required of ["Fonts", "Images", "Sounds"]) {
+			await contentDir.getDirectoryHandle(required, { create: false });
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Writes the game's own ".ContentExists" marker if it is not there.
+ *
+ * <p>Upstream writes this at the end of every content install and refuses to start the game without
+ * it, so the mod's pre-staged content has to leave it behind too. Written after a successful unpack,
+ * and checked on the already-staged path so a run that predates this marker is healed without
+ * another 48 MB unpack.
+ */
+async function ensureContentExists(root) {
+	try {
+		await root.getFileHandle(OPFS_CONTENT_EXISTS_NAME, { create: false });
+		return;
+	} catch {
+		// Not there yet; create it below.
+	}
+	try {
+		const handle = await root.getFileHandle(OPFS_CONTENT_EXISTS_NAME, { create: true });
+		const writable = await handle.createWritable();
+		await writable.write("staged by craftraria");
+		await writable.close();
+		console.log("[craftraria] wrote the game's " + OPFS_CONTENT_EXISTS_NAME + " marker");
+	} catch (failure) {
+		console.error("[craftraria] could not write " + OPFS_CONTENT_EXISTS_NAME + ": " + failure);
+	}
+}
+
+async function resolveDir(dir, segments) {
+	let current = dir;
+	for (const segment of segments) {
+		current = await current.getDirectoryHandle(segment, { create: true });
+	}
+	return current;
+}
+
+async function writeOpfsFile(root, path, bytes, dirCache) {
+	const segments = path.split("/").filter(segment => segment.length > 0 && segment !== ".");
+	const name = segments.pop();
+	let dir = root;
+	let key = "";
+	for (const segment of segments) {
+		key = key ? key + "/" + segment : segment;
+		if (!dirCache.has(key)) {
+			dirCache.set(key, dir.getDirectoryHandle(segment, { create: true }));
+		}
+		dir = await dirCache.get(key);
+	}
+	const handle = await dir.getFileHandle(name, { create: true });
+	const writable = await handle.createWritable();
+	await writable.write(bytes);
+	await writable.close();
+	return bytes.length;
+}
+
+/** Minimal ustar reader matching the mod's ContentPacker output (512-byte blocks, NUL fields). */
+function readTar(bytes) {
+	const entries = [];
+	let offset = 0;
+	while (offset + 512 <= bytes.length) {
+		const header = bytes.subarray(offset, offset + 512);
+		let zero = true;
+		for (const b of header) {
+			if (b !== 0) { zero = false; break; }
+		}
+		if (zero) {
+			// The terminator: a complete archive.
+			return { entries, truncated: false };
+		}
+		const name = readCString(header, 0, 100);
+		const size = parseInt(readCString(header, 124, 12).trim() || "0", 8) || 0;
+		const typeFlag = String.fromCharCode(header[156]);
+		const contentStart = offset + 512;
+		if (contentStart + size > bytes.length) {
+			// The header promises more bytes than the archive holds.
+			break;
+		}
+		if (typeFlag === "0" || typeFlag === "\0") {
+			entries.push({ name, content: bytes.subarray(contentStart, contentStart + size) });
+		}
+		offset = contentStart + size + ((512 - (size % 512)) % 512);
+	}
+	// The walk ran out of blocks without ever meeting the terminator, or a header overran the
+	// archive: either way this is a partial pack, and every entry parsed so far was fine. Checking
+	// the terminator rather than the size matters, because a crash-interrupted write usually stops
+	// on a block boundary and still parses to a plausible file count.
+	return { entries, truncated: true };
+}
+
+function readCString(block, offset, length) {
+	let end = offset;
+	while (end < offset + length && block[end] !== 0) { end++; }
+	return new TextDecoder().decode(block.subarray(offset, end));
+}
+
+async function boot() {
+	try {
+		report("Reading your Terraria Content...", 0.02);
+		await stageContent();
+		// Do not uncover the window yet. Between "content staged" and the game's own UI appearing
+		// sits the dotnet runtime's cold start - tens of seconds on a first launch - and a window
+		// showing nothing for that whole time reads as a broken mod rather than a slow one. The
+		// overlay stays up, saying so, until the page behind it is worth showing.
+		report("Starting the game engine...", 0.95,
+				"The first launch of the engine takes a moment; later ones are quick.");
+		const module = document.createElement("script");
+		module.type = "module";
+		module.crossOrigin = "anonymous";
+		module.src = "/assets/index.js";
+		document.body.appendChild(module);
+		await waitForGameUi();
+	} catch (failure) {
+		// A failed stage is a message, not a blank window: the player can rerun /craftraria reload.
+		// The error goes to the console too, because the note is the only place on screen it lands
+		// and a diagnosis from a screenshot of it is guesswork.
+		const reason = String(failure && failure.message ? failure.message : failure);
+		console.error("[craftraria] staging failed: " + reason);
+		stagingText.textContent = "Terraria could not start.";
+		stagingNote.textContent = reason;
+		return;
+	}
+	document.getElementById("staging").hidden = true;
+}
+
+/**
+ * Resolves once the pinned module has mounted its own UI, or after a grace period.
+ *
+ * <p>The module keeps this page's {@code #app} element and fills it (it also marks it
+ * {@code data-component="App"}), so "has children" is the observable signal that the dark-themed
+ * game UI is on screen. The timeout matters: if the module never mounts, the player must still be
+ * able to see and use the window rather than sit behind an overlay forever.
+ */
+function gameUiReady() {
+	const current = document.getElementById("app");
+	if (current == null) {
+		return false;
+	}
+	// The module marks its own mount on this element, and fills it with the splash and main views.
+	// Either signal counts: the attribute is set at insertion, the children can follow a beat later.
+	return current.dataset != null && current.dataset.component === "App"
+			|| current.children.length > 0;
+}
+
+function waitForGameUi() {
+	return new Promise((resolve) => {
+		const started = performance.now();
+		const poll = setInterval(() => {
+			if (gameUiReady()) {
+				clearInterval(poll);
+				resolve();
+				return;
+			}
+			if (performance.now() - started > GAME_UI_TIMEOUT_MILLIS) {
+				clearInterval(poll);
+				// Uncover the window (the player must be able to see whatever is there) but say so in
+				// the title, which the browser screen logs: an engine that never reports ready is the
+				// one failure this page cannot see from inside itself.
+				document.title = "terraria engine did not report ready; see the game log for the console";
+				resolve();
+			}
+		}, 200);
+	});
+}
+
+boot();
+</script>
+</body>
+</html>

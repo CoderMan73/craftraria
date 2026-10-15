@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<!--
+  craftraria M1 environment probe.
+
+  Served by LocalHttpServer (COOP/COEP) and opened in the embedded Chromium. It answers the two
+  questions PLAN.md M1 asks before any game work:
+
+    (a) does OPFS write/read work through the local server?
+    (b) are showDirectoryPicker / showOpenFilePicker / navigator.keyboard.lock available inside
+        Rinku's Chromium?
+
+  Results are rendered on the page and POSTed to /probe-report, which the mod writes to
+  probe-report.json beside this file, so the outcome survives a screenshot and can be read from a
+  terminal (GET /probe-report) or pasted into ai-docs/notes/.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>craftraria probe</title>
+<style>
+  body { background: #0e1116; color: #e6edf3; font: 14px/1.5 monospace; margin: 24px; }
+  h1 { font-size: 16px; }
+  .pass { color: #3ba8ff; }
+  .fail { color: #ff6b6b; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>craftraria environment probe</h1>
+<pre id="out">running...</pre>
+<script>
+"use strict";
+
+const out = document.getElementById("out");
+const lines = [];
+function log(line) {
+  lines.push(line);
+  out.textContent = lines.join("\n");
+}
+
+function feature(name, value) {
+  const text = value === undefined ? "undefined" : String(value);
+  log(`  ${name}: ${text}`);
+  return text;
+}
+
+async function opfsRoundTrip() {
+  if (typeof navigator === "undefined" || !navigator.storage || !navigator.storage.getDirectory) {
+    return { name: "opfs", ok: false, detail: "navigator.storage.getDirectory missing" };
+  }
+  const root = await navigator.storage.getDirectory();
+  const handle = await root.getFileHandle("craftraria-probe.txt", { create: true });
+  const payload = "craftraria-opfs-probe " + new Date().toISOString();
+  const writable = await handle.createWritable();
+  await writable.write(payload);
+  await writable.close();
+  const readBack = await (await handle.getFile()).text();
+  const estimate = await navigator.storage.estimate();
+  return {
+    name: "opfs",
+    ok: readBack === payload,
+    detail: readBack === payload ? "round-trip matched" : "round-trip mismatch",
+    bytesWritten: payload.length,
+    bytesRead: readBack.length,
+    quota: estimate.quota,
+    usage: estimate.usage
+  };
+}
+
+async function run() {
+  const report = {
+    url: location.href,
+    crossOriginIsolated: self.crossOriginIsolated,
+    sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
+    userAgent: navigator.userAgent,
+    startedAt: new Date().toISOString()
+  };
+
+  log("browser:");
+  feature("crossOriginIsolated", report.crossOriginIsolated);
+  feature("SharedArrayBuffer", report.sharedArrayBuffer);
+  feature("userAgent", report.userAgent);
+
+  log("");
+  log("file system access API surface (b availability):");
+  report.showDirectoryPicker = typeof self.showDirectoryPicker === "function";
+  report.showOpenFilePicker = typeof self.showOpenFilePicker === "function";
+  report.showSaveFilePicker = typeof self.showSaveFilePicker === "function";
+  report.keyboardLock = !!(navigator.keyboard && typeof navigator.keyboard.lock === "function");
+  feature("showDirectoryPicker", report.showDirectoryPicker);
+  feature("showOpenFilePicker", report.showOpenFilePicker);
+  feature("showSaveFilePicker", report.showSaveFilePicker);
+  feature("navigator.keyboard.lock", report.keyboardLock);
+
+  log("");
+  log("opfs round-trip through the local server:");
+  let opfs;
+  try {
+    opfs = await opfsRoundTrip();
+  } catch (failure) {
+    opfs = { name: "opfs", ok: false, detail: String(failure && failure.message ? failure.message : failure) };
+  }
+  report.opfs = opfs;
+  log(`  result: ${opfs.ok ? "PASS" : "FAIL"} (${opfs.detail})`);
+  if (opfs.quota !== undefined) {
+    log(`  storage.estimate quota=${opfs.quota} usage=${opfs.usage}`);
+  }
+
+  report.finishedAt = new Date().toISOString();
+  log("");
+  log(`report posting to /probe-report ...`);
+
+  try {
+    const response = await fetch("/probe-report", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(report)
+    });
+    log(`  POST /probe-report -> ${response.status}`);
+  } catch (failure) {
+    log(`  POST /probe-report FAILED: ${failure}`);
+  }
+
+  const failed = [];
+  if (!report.crossOriginIsolated) failed.push("crossOriginIsolated");
+  if (!report.sharedArrayBuffer) failed.push("SharedArrayBuffer");
+  if (!opfs.ok) failed.push("opfs");
+  log("");
+  log(failed.length === 0
+    ? "PROBE PASSED: environment is usable for OPFS staging."
+    : "PROBE FAILED: " + failed.join(", "));
+}
+
+run();
+</script>
+</body>
+</html>
