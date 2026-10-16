@@ -45,6 +45,8 @@ public class BrowserScreen extends Screen {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("craftraria");
 
+    private static long lastTextureNotReadyLog = 0;
+
     public static final Component TITLE = Component.literal("Terraria");
     /** How much the window may move away from the size the page was loaded at before it is reported. */
     private static final double SIZE_CHANGE_TOLERANCE = 0.10;
@@ -458,6 +460,16 @@ public class BrowserScreen extends Screen {
                         interiorWidth, interiorHeight,
                         interiorWidth, interiorHeight
                 );
+            } else {
+                LOGGER.warn("Browser texture ready but identifier is null; interior={}x{} pos={}",
+                        interiorWidth, interiorHeight, interiorX + "," + interiorY);
+            }
+        } else if (browser != null) {
+            long now = System.currentTimeMillis();
+            if (now - lastTextureNotReadyLog > 5000) {
+                lastTextureNotReadyLog = now;
+                LOGGER.warn("Browser texture not ready; interior={}x{} pos={} browser={}",
+                        interiorWidth, interiorHeight, interiorX + "," + interiorY, browser.isTextureReady());
             }
         }
 
