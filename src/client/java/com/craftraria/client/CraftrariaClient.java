@@ -6,6 +6,8 @@ import com.craftraria.client.browser.TerrariaStats;
 import com.craftraria.client.config.CraftrariaConfig;
 import com.craftraria.client.downloader.LibcurlRuntimeDownloader;
 import com.craftraria.client.downloader.TerrariaBuildDownloader;
+import com.craftraria.client.content.ContentPacker;
+import com.craftraria.client.content.TerrariaInstall;
 import com.craftraria.client.install.ContentChooser;
 import com.craftraria.client.install.TerrariaInstallResolver;
 import com.craftraria.client.install.TerrariaInstallResolver.Outcome;
@@ -186,6 +188,10 @@ public class CraftrariaClient implements ClientModInitializer {
 	 * reload therefore refreshes the recorded install (auto-detect when unset), repacks
 	 * {@code content.tar} and reattaches a fresh session - the game restarts from its opening menu,
 	 * which is what the reload button on the title bar does too.
+	 *
+	 * <p>Packing 739 MB of Content into content.tar takes minutes and blocks Minecraft's client thread
+	 * if run inline, so it runs on its own daemon thread with a status chat message, and the page
+	 * reloads only after the pack completes.
 	 */
 	private static void handleReload() {
 		Path content = TerrariaInstallResolver.recordedContentDirectory();
@@ -195,11 +201,28 @@ public class CraftrariaClient implements ClientModInitializer {
 			if (!resolved.success()) {
 				return;
 			}
-		} else {
-			TerrariaInstallResolver.record(content);
+			content = TerrariaInstallResolver.recordedContentDirectory();
+			if (content == null) {
+				sendStatus("Could not resolve Terraria Content for packing.");
+				return;
+			}
 		}
-		TerrariaBrowser.reloadPage();
-		sendStatus("Terraria reloaded.");
+		Path contentDir = content;
+		sendStatus("Packing Terraria Content into content.tar...");
+		Thread repacking = new Thread(() -> {
+			Path target = CraftrariaPaths.servedDirectory().resolve("content.tar");
+			String marker = ContentPacker.pack(contentDir, target);
+			if (marker != null) {
+				sendStatus("Terraria Content packed; reloading the in-game window.");
+				TerrariaBrowser.reloadPage();
+				LOGGER.info("content.tar repacked and page reloaded");
+			} else {
+				sendStatus("Failed to pack Terraria Content; see the log.");
+				LOGGER.error("content.tar repack failed during reload");
+			}
+		}, "craftraria-content-repack");
+		repacking.setDaemon(true);
+		repacking.start();
 	}
 
 	private static void toggleStatsOverlay() {

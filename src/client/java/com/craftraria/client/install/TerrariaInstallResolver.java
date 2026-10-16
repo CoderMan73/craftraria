@@ -75,7 +75,7 @@ public final class TerrariaInstallResolver {
 		return Outcome.failure("No Terraria install was found. Use /craftraria pick or /craftraria load <path>.");
 	}
 
-	/** Validates, records and repacks a directory the player supplied. */
+	/** Validates and records a directory the player supplied, then kicks off a background pack. */
 	public static Outcome record(Path candidate) {
 		List<String> missing = TerrariaInstall.missingDirectories(candidate);
 		if (!missing.isEmpty()) {
@@ -85,19 +85,27 @@ public final class TerrariaInstallResolver {
 
 		Path normalized = candidate.toAbsolutePath().normalize();
 		CraftrariaConfig.getInstance().setTerrariaContentPath(normalized.toString());
-		repack(normalized);
-		return Outcome.ok("Terraria Content set to " + normalized
-				+ (packedMarker() == null ? " (packing failed; see the log)" : ""));
+		repackAsync(normalized);
+		return Outcome.ok("Terraria Content set to " + normalized + ". Packing in the background...");
 	}
 
 	/**
 	 * Packs the recorded Content directory into {@code game/www/content.tar}, replacing the previous
-	 * copy and its version marker so the page re-extracts on next load. Best-effort: a pack failure
-	 * is logged and reported by {@link #record}, not thrown into the command thread.
+	 * copy and its version marker so the page re-extracts on next load. Runs on a daemon thread so the
+	 * client thread is not blocked for 370 MB of disk I/O.
 	 */
-	public static void repack(Path contentDirectory) {
-		Path target = CraftrariaPaths.servedDirectory().resolve("content.tar");
-		ContentPacker.pack(contentDirectory, target);
+	public static void repackAsync(Path contentDirectory) {
+		Thread repacking = new Thread(() -> {
+			Path target = CraftrariaPaths.servedDirectory().resolve("content.tar");
+			String marker = ContentPacker.pack(contentDirectory, target);
+			if (marker != null) {
+				LOGGER.info("content.tar packed; version marker: {}", marker.split("\n")[0]);
+			} else {
+				LOGGER.error("content.tar pack failed during repackAsync");
+			}
+		}, "craftraria-content-repack");
+		repacking.setDaemon(true);
+		repacking.start();
 	}
 
 	public static String packedMarker() {

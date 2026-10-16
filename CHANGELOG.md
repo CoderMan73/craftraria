@@ -132,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RinkuDownloadListener.isFailed()` before opening and `BrowserScreen` closes itself on
   `onInit(false)`, both with the delete-`run/rinku-libraries` retry named in the message
   (`ai-docs/notes/2026-10-14-rinku-jcef-install-crash.md`).
+- `/craftraria reload` no longer freezes Minecraft while packing 739 MB of Content into
+  `content.tar`: `TerrariaInstallResolver.repackAsync()` runs on a daemon thread, and the page reloads
+  only after packing completes; `/craftraria load` and `/craftraria pick` also pack asynchronously.
 - The window opened on "Not Found" because `ServedPages` installed from a hardcoded page list that
   never mentioned the M4 loader page, while the version marker still read "installed" - so
   `www/index.html` was never copied and the server had nothing to answer with. Pages are now
